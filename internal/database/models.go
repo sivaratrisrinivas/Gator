@@ -19,6 +19,11 @@ type Feed struct {
 	Url           string
 	UserID        uuid.UUID
 	LastFetchedAt sql.NullTime
+	Etag          sql.NullString
+	LastModified  sql.NullString
+	FailureCount  int32
+	LastError     sql.NullString
+	NextFetchAt   sql.NullTime
 }
 
 type FeedFollow struct {
