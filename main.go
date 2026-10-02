@@ -6,8 +6,8 @@ import (
 	"os"
 
 	_ "github.com/lib/pq"
-	"github.com/srinivassivaratri/Gator/internal/config"
-	"github.com/srinivassivaratri/Gator/internal/database"
+	"github.com/sivaratrisrinivas/Gator/internal/config"
+	"github.com/sivaratrisrinivas/Gator/internal/database"
 )
 
 // state holds core dependencies needed throughout the application

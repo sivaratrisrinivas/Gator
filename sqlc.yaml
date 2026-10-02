@@ -1,11 +1,6 @@
 version: "2"
 sql:
-  - schema:
-      - "sql/schema/001_users.sql"
-      - "sql/schema/002_feeds.sql"
-      - "sql/schema/003_feed_follows.sql"
-      - "sql/schema/004_feed_last_fetched.sql"
-      - "sql/schema/005_posts.sql"
+  - schema: "sql/schema"
     queries: "sql/queries"
     engine: "postgresql"
     gen:

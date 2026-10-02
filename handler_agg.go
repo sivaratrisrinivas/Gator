@@ -2,90 +2,83 @@ package main
 
 import (
 	"context"
-	"database/sql"
+	"flag"
 	"fmt"
-	"log"
-	"strings"
+	"log/slog"
+	"os/signal"
+	"syscall"
 	"time"
 
-	"github.com/google/uuid"
-
-	"github.com/srinivassivaratri/Gator/internal/database"
+	"github.com/sivaratrisrinivas/Gator/internal/database"
+	"github.com/sivaratrisrinivas/Gator/internal/rss"
 )
 
-func handlerAgg(s *state, cmd command, user database.User) error {
-	if len(cmd.Args) != 1 {
-		return fmt.Errorf("usage: agg <time_between_reqs>")
+// handlerAgg runs the aggregator: agg <interval> [-workers N] [-batch N] [-once]
+func handlerAgg(s *state, cmd command, _ database.User) error {
+	fs := flag.NewFlagSet("agg", flag.ContinueOnError)
+	workers := fs.Int("workers", 8, "concurrent feed fetches")
+	batch := fs.Int("batch", 32, "feeds claimed per tick")
+	once := fs.Bool("once", false, "run a single batch and exit")
+	if len(cmd.Args) < 1 {
+		return fmt.Errorf("usage: agg <time_between_reqs> [-workers N] [-batch N] [-once]")
 	}
-
-	timeBetweenRequests, err := time.ParseDuration(cmd.Args[0])
+	interval, err := time.ParseDuration(cmd.Args[0])
 	if err != nil {
 		return fmt.Errorf("couldn't parse duration: %w", err)
 	}
+	if err := fs.Parse(cmd.Args[1:]); err != nil {
+		return err
+	}
+	if *workers < 1 || *batch < 1 {
+		return fmt.Errorf("workers and batch must be positive")
+	}
 
-	fmt.Printf("Collecting feeds every %v\n", timeBetweenRequests)
+	sc := &Scraper{
+		DB: s.db, Fetcher: rss.NewFetcher(),
+		Workers: *workers, BatchSize: *batch,
+		MaxBackoff: 6 * time.Hour, Now: time.Now,
+	}
 
-	// Start immediate fetch, then use ticker for subsequent fetches
-	ticker := time.NewTicker(timeBetweenRequests)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	fmt.Printf("Collecting feeds every %v with %d workers (batch %d)\n", interval, *workers, *batch)
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-
 	for {
-		err := scrapeFeeds(s)
+		start := time.Now()
+		outcomes, err := sc.RunOnce(ctx)
 		if err != nil {
-			log.Printf("error scraping feeds: %v", err)
+			slog.Error("scrape batch", "err", err)
 		}
-		<-ticker.C
+		report(outcomes, time.Since(start))
+		if *once {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			fmt.Println("stopping aggregator")
+			return nil
+		case <-ticker.C:
+		}
 	}
 }
 
-func scrapeFeeds(s *state) error {
-	feed, err := s.db.GetNextFeedToFetch(context.Background())
-	if err != nil {
-		return fmt.Errorf("couldn't get next feed: %w", err)
-	}
-
-	// Mark as fetched first to prevent excessive fetches on error
-	err = s.db.MarkFeedFetched(context.Background(), feed.ID)
-	if err != nil {
-		return fmt.Errorf("couldn't mark feed as fetched: %w", err)
-	}
-
-	fmt.Printf("Fetching feed %s...\n", feed.Url)
-	rssFeed, err := fetchFeed(context.Background(), feed.Url)
-	if err != nil {
-		return fmt.Errorf("couldn't fetch feed: %w", err)
-	}
-
-	fmt.Printf("Found %d posts in %s\n", len(rssFeed.Channel.Item), feed.Name)
-	for _, item := range rssFeed.Channel.Item {
-		publishedAt := sql.NullTime{}
-		if t, err := time.Parse(time.RFC1123Z, item.PubDate); err == nil {
-			publishedAt = sql.NullTime{
-				Time:  t,
-				Valid: true,
-			}
-		}
-
-		// Try to create post, ignore if URL already exists
-		_, err := s.db.CreatePost(context.Background(), database.CreatePostParams{
-			ID:        uuid.New(),
-			CreatedAt: time.Now().UTC(),
-			UpdatedAt: time.Now().UTC(),
-			Title:     item.Title,
-			Url:       item.Link,
-			Description: sql.NullString{
-				String: item.Description,
-				Valid:  item.Description != "",
-			},
-			PublishedAt: publishedAt,
-			FeedID:      feed.ID,
-		})
-		if err != nil {
-			if !strings.Contains(err.Error(), "duplicate key") {
-				log.Printf("couldn't create post: %v", err)
-			}
+func report(outcomes []FeedOutcome, took time.Duration) {
+	var newPosts, notModified, failed int
+	for _, o := range outcomes {
+		switch {
+		case o.Err != nil:
+			failed++
+			fmt.Printf("  x %s: %v\n", o.Feed.Name, o.Err)
+		case o.NotModified:
+			notModified++
+			fmt.Printf("  = %s: not modified\n", o.Feed.Name)
+		default:
+			newPosts += o.NewPosts
+			fmt.Printf("  + %s: %d new posts\n", o.Feed.Name, o.NewPosts)
 		}
 	}
-	fmt.Println("------------------------")
-	return nil
+	fmt.Printf("batch: %d feeds, %d new posts, %d not modified, %d failed in %v\n",
+		len(outcomes), newPosts, notModified, failed, took.Round(time.Millisecond))
 }

@@ -13,10 +13,64 @@ import (
 	"github.com/google/uuid"
 )
 
+const claimFeedsToFetch = `-- name: ClaimFeedsToFetch :many
+WITH due AS (
+    SELECT id FROM feeds
+    WHERE next_fetch_at IS NULL OR next_fetch_at <= NOW()
+    ORDER BY last_fetched_at ASC NULLS FIRST
+    LIMIT $1
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE feeds
+SET last_fetched_at = NOW(), updated_at = NOW()
+FROM due
+WHERE feeds.id = due.id
+RETURNING feeds.id, feeds.created_at, feeds.updated_at, feeds.name, feeds.url, feeds.user_id, feeds.last_fetched_at, feeds.etag, feeds.last_modified, feeds.failure_count, feeds.last_error, feeds.next_fetch_at
+`
+
+// Atomically claims up to N due feeds. FOR UPDATE SKIP LOCKED in a
+// materialized CTE lets several aggregator processes run at once without
+// fetching the same feed twice. All times come from the database clock.
+func (q *Queries) ClaimFeedsToFetch(ctx context.Context, batchSize int32) ([]Feed, error) {
+	rows, err := q.db.QueryContext(ctx, claimFeedsToFetch, batchSize)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Feed
+	for rows.Next() {
+		var i Feed
+		if err := rows.Scan(
+			&i.ID,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.Name,
+			&i.Url,
+			&i.UserID,
+			&i.LastFetchedAt,
+			&i.Etag,
+			&i.LastModified,
+			&i.FailureCount,
+			&i.LastError,
+			&i.NextFetchAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const createFeed = `-- name: CreateFeed :one
 INSERT INTO feeds (id, created_at, updated_at, name, url, user_id)
 VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, created_at, updated_at, name, url, user_id, last_fetched_at
+RETURNING id, created_at, updated_at, name, url, user_id, last_fetched_at, etag, last_modified, failure_count, last_error, next_fetch_at
 `
 
 type CreateFeedParams struct {
@@ -46,6 +100,11 @@ func (q *Queries) CreateFeed(ctx context.Context, arg CreateFeedParams) (Feed, e
 		&i.Url,
 		&i.UserID,
 		&i.LastFetchedAt,
+		&i.Etag,
+		&i.LastModified,
+		&i.FailureCount,
+		&i.LastError,
+		&i.NextFetchAt,
 	)
 	return i, err
 }
@@ -65,7 +124,7 @@ func (q *Queries) DeleteFeed(ctx context.Context, arg DeleteFeedParams) error {
 }
 
 const getFeedByURL = `-- name: GetFeedByURL :one
-SELECT id, created_at, updated_at, name, url, user_id, last_fetched_at FROM feeds WHERE url = $1
+SELECT id, created_at, updated_at, name, url, user_id, last_fetched_at, etag, last_modified, failure_count, last_error, next_fetch_at FROM feeds WHERE url = $1
 `
 
 func (q *Queries) GetFeedByURL(ctx context.Context, url string) (Feed, error) {
@@ -79,12 +138,17 @@ func (q *Queries) GetFeedByURL(ctx context.Context, url string) (Feed, error) {
 		&i.Url,
 		&i.UserID,
 		&i.LastFetchedAt,
+		&i.Etag,
+		&i.LastModified,
+		&i.FailureCount,
+		&i.LastError,
+		&i.NextFetchAt,
 	)
 	return i, err
 }
 
 const getFeeds = `-- name: GetFeeds :many
-SELECT id, created_at, updated_at, name, url, user_id, last_fetched_at FROM feeds
+SELECT id, created_at, updated_at, name, url, user_id, last_fetched_at, etag, last_modified, failure_count, last_error, next_fetch_at FROM feeds
 `
 
 func (q *Queries) GetFeeds(ctx context.Context) ([]Feed, error) {
@@ -104,6 +168,11 @@ func (q *Queries) GetFeeds(ctx context.Context) ([]Feed, error) {
 			&i.Url,
 			&i.UserID,
 			&i.LastFetchedAt,
+			&i.Etag,
+			&i.LastModified,
+			&i.FailureCount,
+			&i.LastError,
+			&i.NextFetchAt,
 		); err != nil {
 			return nil, err
 		}
@@ -120,7 +189,7 @@ func (q *Queries) GetFeeds(ctx context.Context) ([]Feed, error) {
 
 const getFeedsWithUser = `-- name: GetFeedsWithUser :many
 SELECT 
-    feeds.id, feeds.created_at, feeds.updated_at, feeds.name, feeds.url, feeds.user_id, feeds.last_fetched_at,
+    feeds.id, feeds.created_at, feeds.updated_at, feeds.name, feeds.url, feeds.user_id, feeds.last_fetched_at, feeds.etag, feeds.last_modified, feeds.failure_count, feeds.last_error, feeds.next_fetch_at,
     users.name as user_name
 FROM feeds
 JOIN users ON feeds.user_id = users.id
@@ -135,6 +204,11 @@ type GetFeedsWithUserRow struct {
 	Url           string
 	UserID        uuid.UUID
 	LastFetchedAt sql.NullTime
+	Etag          sql.NullString
+	LastModified  sql.NullString
+	FailureCount  int32
+	LastError     sql.NullString
+	NextFetchAt   sql.NullTime
 	UserName      string
 }
 
@@ -155,6 +229,11 @@ func (q *Queries) GetFeedsWithUser(ctx context.Context, userID uuid.UUID) ([]Get
 			&i.Url,
 			&i.UserID,
 			&i.LastFetchedAt,
+			&i.Etag,
+			&i.LastModified,
+			&i.FailureCount,
+			&i.LastError,
+			&i.NextFetchAt,
 			&i.UserName,
 		); err != nil {
 			return nil, err
@@ -170,35 +249,42 @@ func (q *Queries) GetFeedsWithUser(ctx context.Context, userID uuid.UUID) ([]Get
 	return items, nil
 }
 
-const getNextFeedToFetch = `-- name: GetNextFeedToFetch :one
-SELECT id, created_at, updated_at, name, url, user_id, last_fetched_at FROM feeds 
-ORDER BY COALESCE(last_fetched_at, TIMESTAMP '1970-01-01') ASC
-LIMIT 1
+const recordFeedFailure = `-- name: RecordFeedFailure :one
+UPDATE feeds
+SET failure_count = failure_count + 1,
+    last_error = $1,
+    next_fetch_at = NOW() + make_interval(secs => $2::float8),
+    updated_at = NOW()
+WHERE id = $3
+RETURNING failure_count
 `
 
-func (q *Queries) GetNextFeedToFetch(ctx context.Context) (Feed, error) {
-	row := q.db.QueryRowContext(ctx, getNextFeedToFetch)
-	var i Feed
-	err := row.Scan(
-		&i.ID,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-		&i.Name,
-		&i.Url,
-		&i.UserID,
-		&i.LastFetchedAt,
-	)
-	return i, err
+type RecordFeedFailureParams struct {
+	LastError      sql.NullString
+	BackoffSeconds float64
+	ID             uuid.UUID
 }
 
-const markFeedFetched = `-- name: MarkFeedFetched :exec
+func (q *Queries) RecordFeedFailure(ctx context.Context, arg RecordFeedFailureParams) (int32, error) {
+	row := q.db.QueryRowContext(ctx, recordFeedFailure, arg.LastError, arg.BackoffSeconds, arg.ID)
+	var failure_count int32
+	err := row.Scan(&failure_count)
+	return failure_count, err
+}
+
+const recordFeedSuccess = `-- name: RecordFeedSuccess :exec
 UPDATE feeds
-SET last_fetched_at = NOW(),
-    updated_at = NOW()
+SET etag = $2, last_modified = $3, failure_count = 0, last_error = NULL, next_fetch_at = NULL, updated_at = NOW()
 WHERE id = $1
 `
 
-func (q *Queries) MarkFeedFetched(ctx context.Context, id uuid.UUID) error {
-	_, err := q.db.ExecContext(ctx, markFeedFetched, id)
+type RecordFeedSuccessParams struct {
+	ID           uuid.UUID
+	Etag         sql.NullString
+	LastModified sql.NullString
+}
+
+func (q *Queries) RecordFeedSuccess(ctx context.Context, arg RecordFeedSuccessParams) error {
+	_, err := q.db.ExecContext(ctx, recordFeedSuccess, arg.ID, arg.Etag, arg.LastModified)
 	return err
 }

@@ -1,5 +1,4 @@
-// Defines our module name and Go version
-module github.com/srinivassivaratri/Gator
+module github.com/sivaratrisrinivas/Gator
 
 // Minimum Go version needed
 go 1.22.4

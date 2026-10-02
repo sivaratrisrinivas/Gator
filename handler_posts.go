@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strconv"
 
-	"github.com/srinivassivaratri/Gator/internal/database"
+	"github.com/sivaratrisrinivas/Gator/internal/database"
 )
 
 func handlerBrowse(s *state, cmd command, user database.User) error {
@@ -18,6 +18,9 @@ func handlerBrowse(s *state, cmd command, user database.User) error {
 		limit, err = strconv.Atoi(cmd.Args[0])
 		if err != nil {
 			return fmt.Errorf("limit must be a number: %w", err)
+		}
+		if limit < 1 || limit > 100 {
+			return fmt.Errorf("limit must be between 1 and 100")
 		}
 	}
 
@@ -35,6 +38,7 @@ func handlerBrowse(s *state, cmd command, user database.User) error {
 	posts, err := s.db.GetPostsForUser(context.Background(), database.GetPostsForUserParams{
 		UserID: user.ID,
 		Limit:  int32(limit),
+		Offset: int32((page - 1) * limit),
 	})
 	if err != nil {
 		return fmt.Errorf("error getting posts: %w", err)

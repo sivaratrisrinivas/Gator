@@ -1,144 +1,73 @@
-# 🐊 Gator
+# Gator
 
-Gator is a lightweight command-line tool built in Go that allows you to aggregate and read RSS feeds directly from your terminal. Stay updated with your favorite websites without ever leaving your command line!
+A multi-user RSS and Atom aggregator for the terminal, written in Go with Postgres. The first version came from Boot.dev's "Build a Blog Aggregator in Go" course. I then rebuilt the ingestion side so it behaves like a real feed crawler: concurrent, polite to the sites it polls, safe to run as several processes, and tested.
 
-## Why Gator?
-
-Keeping up with numerous RSS feeds can be challenging, especially when most readers are bloated web apps or desktop applications. As someone who spends a lot of time in the terminal, I wanted an efficient, terminal-based solution that is:
-
-- **Fast and lightweight**: Minimal resource usage, perfect for low-memory devices.
-- **Entirely terminal-based**: No GUI, no distractions—just pure command-line goodness.
-- **Multi-user friendly**: Supports multiple user accounts on the same system.
-- **Smart feed management**: Easily follow and unfollow feeds, with automatic updates.
-
-I built Gator to solve these problems, providing a simple CLI tool that fetches and displays RSS feeds directly in your terminal. No browser needed, no fancy UI—just your favorite content at your fingertips.
-
-## 🏗 Architecture
+## How the aggregator works
 
 ```mermaid
-graph TD
-    A[main.go] --> B[commands.go]
-    B --> C1[handler_user.go]
-    B --> C2[handler_feed.go]
-    B --> C3[handler_follow.go]
-    B --> C4[handler_posts.go]
-    B --> C5[handler_agg.go]
-    B --> C6[handler_reset.go]
-    
-    C1 & C2 & C3 & C4 & C5 & C6 --> D[middleware.go]
-    D --> E[rss_feed.go]
-    D --> F[database.Queries]
-    
-    F --> G1[users.sql]
-    F --> G2[feeds.sql]
-    F --> G3[feed_follows.sql]
-    F --> G4[posts.sql]
-    
-    E --> H[RSS Sources]
-    G1 & G2 & G3 & G4 --> I[(PostgreSQL)]
-
-    style A fill:#00ff9f,stroke:#333,stroke-width:2px,color:black
-    style B fill:#00ff9f,stroke:#333,stroke-width:2px,color:black
-    style C1 fill:#00ff9f,stroke:#333,stroke-width:2px,color:black
-    style C2 fill:#00ff9f,stroke:#333,stroke-width:2px,color:black
-    style C3 fill:#00ff9f,stroke:#333,stroke-width:2px,color:black
-    style C4 fill:#00ff9f,stroke:#333,stroke-width:2px,color:black
-    style C5 fill:#00ff9f,stroke:#333,stroke-width:2px,color:black
-    style C6 fill:#00ff9f,stroke:#333,stroke-width:2px,color:black
-    style D fill:#00bfff,stroke:#333,stroke-width:2px,color:black
-    style E fill:#00bfff,stroke:#333,stroke-width:2px,color:black
-    style F fill:#00bfff,stroke:#333,stroke-width:2px,color:black
-    style G1 fill:#ff69b4,stroke:#333,stroke-width:2px,color:black
-    style G2 fill:#ff69b4,stroke:#333,stroke-width:2px,color:black
-    style G3 fill:#ff69b4,stroke:#333,stroke-width:2px,color:black
-    style G4 fill:#ff69b4,stroke:#333,stroke-width:2px,color:black
-    style H fill:#ffa500,stroke:#333,stroke-width:2px,color:black
-    style I fill:#ff69b4,stroke:#333,stroke-width:2px,color:black
+flowchart LR
+    T[ticker] --> C["ClaimFeedsToFetch<br/>(CTE + FOR UPDATE SKIP LOCKED)"]
+    C --> P{{worker pool}}
+    P --> F["conditional GET<br/>If-None-Match / If-Modified-Since"]
+    F -->|200| X["parse RSS 2.0 or Atom<br/>13 date formats"] --> U["INSERT ... ON CONFLICT (url) DO NOTHING"]
+    F -->|304| S[record success, keep validators]
+    F -->|error| B["failure_count + 1<br/>next_fetch_at = now + 2^(n-1) min, max 6 h"]
 ```
 
-## 🚀 Quick Start
+1. Each tick claims a batch of due feeds in one SQL statement. `FOR UPDATE SKIP LOCKED` means two or more `gator agg` processes never fetch the same feed.
+2. A bounded worker pool fetches them in parallel.
+3. Requests send the feed's stored `ETag` and `Last-Modified`. A `304 Not Modified` costs the site almost nothing and skips parsing.
+4. Responses are checked for status, capped at 10 MB, and parsed as RSS 2.0 or Atom.
+5. Posts are de-duplicated by URL in the database with `ON CONFLICT DO NOTHING`.
+6. A failing feed backs off exponentially (1, 2, 4 ... minutes, capped at 6 hours) and its last error is stored, so a dead site is not hammered every tick.
 
-1. **Install Gator using the Go toolchain**
-    ```bash
-    go install github.com/yourusername/gator@latest
-    ```
+## What changed from the course version
 
-2. **Create your account**
-    ```bash
-    gator register myusername
-    ```
+| | Course version | Now |
+|---|---|---|
+| Feeds per tick | 1, serially | A claimed batch (default 32) across 8 workers |
+| Multiple aggregators | Would fetch the same feed twice | Safe: `SKIP LOCKED` claims |
+| HTTP | Status ignored, body never closed, no size cap | Status checked, body closed and capped, User-Agent set |
+| Caching | Re-downloaded everything | Conditional GET with ETag and Last-Modified |
+| Formats | RSS only, one date layout (Atom feeds saved 0 posts) | RSS 2.0, Atom 1.0, Dublin Core dates, 13 date layouts |
+| Duplicates | Insert, then string-match "duplicate key" in the error | `ON CONFLICT (url) DO NOTHING`, counts new rows |
+| Failures | Retried every tick forever | Exponential backoff, `last_error` stored |
+| `browse` paging | Page argument was ignored | Real `LIMIT/OFFSET` |
+| Shutdown | Ctrl-C mid-write | Stops cleanly on SIGINT/SIGTERM |
+| Tests | None | Parser and fetcher tests (91% of the rss package) plus Postgres integration tests for the scraper |
+| CI | None | gofmt, vet, race tests against Postgres, sqlc drift check |
 
-3. **Follow some feeds**
-    ```bash
-    gator follow "https://blog.boot.dev/index.xml"
-    gator follow "https://news.ycombinator.com/rss"
-    ```
+### Measured
 
-4. **Start reading!**
-    ```bash
-    gator browse
-    ```
+- One batch of 40 feeds, each server taking 200 ms to answer, 20 items per feed (local Postgres, `go test`): 1 worker took 8.26 s, 8 workers took 1.11 s, both stored all 800 posts. The course version fetched one feed per tick, so the same 40 feeds took 40 ticks.
+- Live run against Hacker News, the Go blog (Atom), a 404 feed and a non-existent host: 40 posts stored with published dates in 1.1 s, both failures recorded with backoff instead of crashing the loop. The course parser would have stored 0 posts from the Go blog because it only understood RSS.
 
-## 📖 Usage
-
-### Available Commands
-
-- `register <name>` - Create a new user account.
-- `login <name>` - Log in to an existing account.
-- `follow <url>` - Follow a new RSS feed.
-- `unfollow <url>` - Unfollow an RSS feed.
-- `following` - List all your followed feeds.
-- `browse [limit] [page]` - Read posts with pagination.
-  - `browse` - Show 10 posts from page 1.
-  - `browse 5` - Show 5 posts from page 1.
-  - `browse 5 2` - Show 5 posts from page 2.
-- `agg <interval>` - Start collecting posts at regular intervals (e.g., `agg 1m`).
-
-### Examples
-
-Unfollow a feed:
+## Use it
 
 ```bash
-gator unfollow "https://blog.boot.dev/index.xml"
+go install github.com/sivaratrisrinivas/Gator@latest
+echo '{"db_url":"postgres://postgres:postgres@localhost:5432/gator?sslmode=disable"}' > ~/.gatorconfig.json
+goose -dir sql/schema postgres "$DB_URL" up
+
+gator register alice
+gator addfeed "Go Blog" https://go.dev/blog/feed.atom
+gator addfeed "Hacker News" https://news.ycombinator.com/rss
+gator agg 1m -workers 8 -batch 32     # or -once for a single batch
+gator browse 10 2                      # 10 posts, page 2
 ```
 
-Start the aggregator to fetch updates every 10 minutes:
+Other commands: `login`, `users`, `feeds`, `follow <url>`, `following`, `unfollow <url>`, `reset`.
+
+## Test
 
 ```bash
-gator agg 10m
+go test ./internal/rss/                                   # no database needed
+createdb gator_test
+TEST_DB_URL="postgres://postgres:postgres@localhost:5432/gator_test?sslmode=disable" go test -race -p 1 ./...
 ```
 
-### Advanced Features
+The integration tests spin up local HTTP feed servers and check de-duplication, 304 handling, backoff after a 502, that four racing aggregators claim 20 feeds with no overlap, and that `browse` pages never repeat a post.
 
-- **Pagination**: Easily navigate through large numbers of posts.
-- **Customizable Fetch Intervals**: Set how often you want to check for new posts.
-- **Multi-user Support**: Multiple users can have separate accounts on the same system.
-- **Automatic Feed Updates**: Gator automatically fetches the latest posts from your followed feeds.
+## Stack
 
-## 🤝 Contributing
-
-1. **Clone the repository**
-    ```bash
-    git clone https://github.com/yourusername/gator.git
-    cd gator
-    ```
-
-2. **Build the project**
-    ```bash
-    go build
-    ```
-
-3. **Run the project**
-    ```bash
-    ./gator
-    ```
-
-4. **Run the tests**
-    ```bash
-    go test ./...
-    ```
-
-5. **Submit a pull request**
-
-    If you'd like to contribute, please fork the repository and open a pull request to the `main` branch.
-
+Go, Postgres, sqlc for typed queries, goose migrations, standard library HTTP and XML.
