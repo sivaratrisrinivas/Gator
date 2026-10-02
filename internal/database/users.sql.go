@@ -25,10 +25,10 @@ RETURNING id, created_at, updated_at, name
 // Parameters needed to create a user
 // Matches the SQL query parameters above
 type CreateUserParams struct {
-	ID        uuid.UUID  // Unique identifier
-	CreatedAt time.Time  // When user was created
-	UpdatedAt time.Time  // When user was last modified
-	Name      string     // Username
+	ID        uuid.UUID // Unique identifier
+	CreatedAt time.Time // When user was created
+	UpdatedAt time.Time // When user was last modified
+	Name      string    // Username
 }
 
 // CreateUser adds a new user to database
@@ -41,7 +41,7 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 		arg.UpdatedAt,
 		arg.Name,
 	)
-	
+
 	// Parse returned row into User struct
 	var i User
 	err := row.Scan(
@@ -92,7 +92,7 @@ func (q *Queries) GetAllUsers(ctx context.Context) ([]User, error) {
 		}
 		items = append(items, i)
 	}
-	
+
 	// Check for errors during iteration
 	if err := rows.Close(); err != nil {
 		return nil, err
@@ -100,7 +100,7 @@ func (q *Queries) GetAllUsers(ctx context.Context) ([]User, error) {
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	
+
 	return items, nil
 }
 
@@ -114,7 +114,7 @@ WHERE name = $1
 func (q *Queries) GetUser(ctx context.Context, name string) (User, error) {
 	// Execute query with username
 	row := q.db.QueryRowContext(ctx, getUser, name)
-	
+
 	// Parse returned row into User struct
 	var i User
 	err := row.Scan(

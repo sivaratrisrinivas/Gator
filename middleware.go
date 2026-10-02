@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/srinivassivaratri/Gator/internal/database"
+	"github.com/sivaratrisrinivas/Gator/internal/database"
 )
 
 // middlewareLoggedIn wraps handlers that require authentication
